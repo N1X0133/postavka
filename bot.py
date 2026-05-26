@@ -19,7 +19,8 @@ ARMY_ROLE_ID = 764091598983921674
 # ------------------------------------------------------------
 CRIMINAL_GUILD_ID = 767449572015341671
 CRIMINAL_CHANNEL_ID = 1476295153525194817
-CRIMINAL_ROLE_ID = 1507772796355219599   # роль, которую упоминаем и которая может забирать
+# Две роли, которые упоминаются и которые могут забрать поставку
+CRIMINAL_ROLE_IDS = [767449572015341675, 767449572452335619]
 
 # ------------------------------------------------------------
 # Подключение к PostgreSQL (вшито)
@@ -241,10 +242,9 @@ async def send_to_criminal_server(order_id):
 
     faction = row['faction']
     delivery_time = row['delivery_time']
-    # Роль криминалов (упоминаем дважды, как просили)
-    role_mention = f"<@&{CRIMINAL_ROLE_ID}>"
+    # Формируем упоминания двух ролей
+    role_mentions = " ".join(f"<@&{rid}>" for rid in CRIMINAL_ROLE_IDS)
 
-    # Получаем сервер и канал
     criminal_guild = bot.get_guild(CRIMINAL_GUILD_ID)
     if criminal_guild is None:
         print(f"[CRIMINAL] Сервер {CRIMINAL_GUILD_ID} не найден. Бот приглашён?")
@@ -254,22 +254,20 @@ async def send_to_criminal_server(order_id):
         print(f"[CRIMINAL] Канал {CRIMINAL_CHANNEL_ID} не найден на сервере {CRIMINAL_GUILD_ID}.")
         return
 
-    # Формируем embed
     embed = discord.Embed(
         title="📦 Поставка для криминальных структур",
         color=discord.Color.orange()
     )
     embed.add_field(name="Фракция", value=faction, inline=True)
     embed.add_field(name="Время поставки", value=delivery_time, inline=True)
-    embed.add_field(name="Уведомление", value=f"{role_mention} {role_mention}", inline=False)
+    embed.add_field(name="Уведомление", value=role_mentions, inline=False)
     embed.set_footer(text=f"ID заказа: {order_id} | by Ilya Vetrov")
 
     # Создаём view с кнопкой "Забрать поставку"
     view = CollectView(order_id)
 
     try:
-        msg = await channel.send(content=role_mention, embed=embed, view=view)
-        # Сохраняем ID этого сообщения в БД
+        msg = await channel.send(content=role_mentions, embed=embed, view=view)
         async with bot.pool.acquire() as conn:
             await conn.execute(
                 "UPDATE orders SET criminal_message_id=$1 WHERE id=$2",
@@ -282,7 +280,7 @@ async def send_to_criminal_server(order_id):
         print(f"[CRIMINAL] Ошибка отправки: {e}")
 
 # ------------------------------------------------------------
-# Кнопка "Забрать поставку" (сервер 2, роль криминалов)
+# Кнопка "Забрать поставку" (сервер 2, роли криминалов)
 # ------------------------------------------------------------
 class CollectView(discord.ui.View):
     def __init__(self, order_id):
@@ -291,12 +289,16 @@ class CollectView(discord.ui.View):
 
     @discord.ui.button(label="Забрать поставку", style=discord.ButtonStyle.primary, custom_id="collect_delivery")
     async def collect(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Проверяем роль
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Ошибка.", ephemeral=True)
             return
-        role = interaction.guild.get_role(CRIMINAL_ROLE_ID)
-        if role is None or role not in interaction.user.roles:
+
+        # Проверяем, есть ли у пользователя хотя бы одна из разрешённых ролей
+        has_role = any(
+            interaction.guild.get_role(rid) in interaction.user.roles
+            for rid in CRIMINAL_ROLE_IDS
+        )
+        if not has_role:
             await interaction.response.send_message("❌ Только уполномоченные могут забрать поставку.", ephemeral=True)
             return
 
@@ -304,17 +306,13 @@ class CollectView(discord.ui.View):
         async with bot.pool.acquire() as conn:
             await conn.execute("UPDATE orders SET status='collected' WHERE id=$1", self.order_id)
 
-        # Обновляем сообщение: меняем embed, отключаем кнопку
         embed = interaction.message.embeds[0]
         embed.title = "✅ Поставка забрана"
         embed.color = discord.Color.green()
         embed.set_footer(text=embed.footer.text + " | Статус: забрана")
-        # Убираем кнопку
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(embed=embed, view=self)
-
-        # Опционально: уведомим заказчика в ЛС? Пока не делаем.
 
 # ------------------------------------------------------------
 # Запуск
