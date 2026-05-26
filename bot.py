@@ -16,9 +16,14 @@ POLICE_ROLE_ID = 1508951206683213885        # Роль @Полиция (МВД)
 FSB_ROLE_ID = 1508951249444274307           # Роль @ФСБ
 
 # ------------------------------------------------------------
-# Подключение к PostgreSQL (строка берётся из переменной окружения)
+# Подключение к PostgreSQL (строка вшита напрямую)
 # ------------------------------------------------------------
-DB_DSN = os.getenv("DATABASE_URL")
+DB_DSN = (
+    "postgresql://bothost_db_eb47576e4dad:"
+    "VWNyYcmbXI4C7KW-YKqzgvjrwxrMH7RIqWOO3UQEb_4"
+    "@node1.pghost.ru:15722/bothost_db_eb47576e4dad"
+    "?sslmode=require"
+)
 
 async def create_pool():
     """Создаёт пул соединений и инициализирует таблицу заказов."""
@@ -135,7 +140,7 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
 
     message = await order_channel.send(embed=embed, view=view)
 
-    # 6) Сохраняем ID сообщения в БД (для возможных будущих доработок)
+    # 6) Сохраняем ID сообщения в БД
     async with bot.pool.acquire() as conn:
         await conn.execute(
             "UPDATE orders SET message_id = $1 WHERE id = $2",
@@ -180,7 +185,7 @@ class OrderApproveView(discord.ui.View):
                 new_status, self.order_id
             )
 
-        # Редактируем исходное сообщение: меняем Embed, отключаем кнопки
+        # Редактируем исходное сообщение
         embed = interaction.message.embeds[0]
         embed.title = title
         embed.color = color
