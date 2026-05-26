@@ -10,7 +10,7 @@ from discord.ext import commands
 # ID сервера, каналов и ролей
 # ------------------------------------------------------------
 GUILD_ID = 764090907657240586
-ORDER_CHANNEL_ID = 767449572015341671          # Единый канал для заказа и одобрения
+ORDER_CHANNEL_ID = 1178807307921002578          # Канал, где работает команда и появляются заявки
 ORDERER_ROLE_ID = 1178807389420527646          # Роль заказчика
 ARMY_ROLE_ID = 764091598983921674              # Роль Армии (одобрение)
 
@@ -56,17 +56,13 @@ class DeliveryBot(commands.Bot):
         await self.tree.sync(guild=guild)
         print(f"Слэш-команды синхронизированы с сервером {GUILD_ID}")
 
-    # Глобальный обработчик ошибок для app_commands
     async def on_application_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ):
-        # Логируем полный трейсбек в консоль
         print(f"[ОШИБКА] Команда /{interaction.command.name} от {interaction.user}:")
         traceback.print_exception(type(error), error, error.__traceback__)
 
-        # Отправляем пользователю сообщение об ошибке (ephemeral, если возможно)
         if interaction.response.is_done():
-            # Уже был ответ defer или send, используем followup
             await interaction.followup.send(
                 f"❌ Произошла внутренняя ошибка: {error}", ephemeral=True
             )
@@ -95,13 +91,14 @@ bot = None
     app_commands.Choice(name="Полиция", value="Полиция")
 ])
 async def order(interaction: discord.Interaction, фракция: app_commands.Choice[str], время: str):
-    # Сразу откладываем ответ, чтобы Discord не ругался
     await interaction.response.defer(ephemeral=True)
 
-    # Проверка канала
+    # Проверка канала – теперь используется правильный ID
     if interaction.channel_id != ORDER_CHANNEL_ID:
+        order_channel = interaction.guild.get_channel(ORDER_CHANNEL_ID)
+        channel_mention = order_channel.mention if order_channel else "указанный канал"
         await interaction.followup.send(
-            f"❌ Эта команда доступна только в канале <#{ORDER_CHANNEL_ID}>.",
+            f"❌ Эта команда доступна только в канале {channel_mention}.",
             ephemeral=True
         )
         return
@@ -120,7 +117,7 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
         )
         return
 
-    # Запись в БД (без try/except — теперь все ошибки уйдут в общий обработчик)
+    # Запись в БД
     async with bot.pool.acquire() as conn:
         order_id = await conn.fetchval(
             "INSERT INTO orders (guild_id, channel_id, author_id, author_name, faction, delivery_time) "
@@ -133,7 +130,7 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
             время
         )
 
-    # Создание Embed
+    # Embed и кнопки
     embed = discord.Embed(
         title="🛒 Новый заказ поставки",
         color=discord.Color.blue()
@@ -153,9 +150,12 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
         )
         return
 
-    message = await order_channel.send(embed=embed, view=view)
+    try:
+        message = await order_channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        await interaction.followup.send("❌ У бота нет прав отправлять сообщения в этот канал.", ephemeral=True)
+        return
 
-    # Сохраняем message_id
     async with bot.pool.acquire() as conn:
         await conn.execute(
             "UPDATE orders SET message_id = $1 WHERE id = $2",
