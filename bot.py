@@ -1,6 +1,7 @@
 import os
 import asyncio
 import traceback
+import datetime
 import asyncpg
 import discord
 from discord import app_commands
@@ -19,7 +20,6 @@ ARMY_ROLE_ID = 764091598983921674
 # ------------------------------------------------------------
 CRIMINAL_GUILD_ID = 767449572015341671
 CRIMINAL_CHANNEL_ID = 1476295153525194817
-# Две роли, которые упоминаются и которые могут забрать поставку
 CRIMINAL_ROLE_IDS = [767449572015341675, 767449572452335619]
 
 # ------------------------------------------------------------
@@ -35,7 +35,6 @@ async def create_pool():
     print("[DB] Подключаюсь к PostgreSQL...")
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as conn:
-        # Создаём таблицу, если её нет
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id SERIAL PRIMARY KEY,
@@ -53,7 +52,6 @@ async def create_pool():
             )
         """)
 
-        # Проверяем и добавляем отсутствующие колонки (для старых таблиц)
         for col, coltype in [
             ("person_count", "INTEGER NOT NULL DEFAULT 0"),
             ("author_name", "TEXT NOT NULL DEFAULT ''"),
@@ -113,7 +111,7 @@ bot = None
 )
 @app_commands.describe(
     фракция="Выберите фракцию",
-    время="Время поставки (например, 15:00)",
+    время="Время поставки (формат ЧЧ:ММ, например 15:00)",
     количество="Кол-во человек от вашей фракции"
 )
 @app_commands.choices(фракция=[
@@ -149,6 +147,13 @@ async def order(
         await interaction.followup.send("❌ Количество человек должно быть больше нуля.", ephemeral=True)
         return
 
+    # Валидация формата времени
+    try:
+        parsed_time = datetime.datetime.strptime(время, '%H:%M')
+    except ValueError:
+        await interaction.followup.send("❌ Неверный формат времени. Используйте ЧЧ:ММ (например, 15:00).", ephemeral=True)
+        return
+
     # Запись в БД
     async with bot.pool.acquire() as conn:
         order_id = await conn.fetchval(
@@ -163,6 +168,8 @@ async def order(
             количество
         )
 
+    # Создаём Embed с видимым упоминанием роли Армии
+    army_mention = f"<@&{ARMY_ROLE_ID}>"
     embed = discord.Embed(
         title="🛒 Новый заказ поставки",
         color=discord.Color.blue()
@@ -171,6 +178,7 @@ async def order(
     embed.add_field(name="Время поставки", value=время, inline=True)
     embed.add_field(name="Кол-во человек", value=str(количество), inline=True)
     embed.add_field(name="Заказчик", value=member.mention, inline=False)
+    embed.add_field(name="Уведомление", value=army_mention, inline=False)
     embed.set_footer(text=f"ID заказа: {order_id} | by Ilya Vetrov")
 
     view = OrderApproveView(order_id)
@@ -181,7 +189,12 @@ async def order(
         return
 
     try:
-        message = await order_channel.send(embed=embed, view=view)
+        # Пинг роли (контент) + embed с упоминанием
+        message = await order_channel.send(
+            content=army_mention,
+            embed=embed,
+            view=view
+        )
     except discord.Forbidden:
         await interaction.followup.send("❌ У бота нет прав отправлять сообщения.", ephemeral=True)
         return
@@ -216,7 +229,6 @@ class OrderApproveView(discord.ui.View):
             await interaction.response.send_message("Только Армия может принимать решение.", ephemeral=True)
             return
 
-        # Обновляем статус в БД
         async with bot.pool.acquire() as conn:
             await conn.execute("UPDATE orders SET status=$1 WHERE id=$2", new_status, self.order_id)
 
@@ -228,12 +240,26 @@ class OrderApproveView(discord.ui.View):
             child.disabled = True
         await interaction.response.edit_message(embed=embed, view=self)
 
-        # Если одобрено – отправляем уведомление на сервер 2
         if new_status == "approved":
-            await send_to_criminal_server(self.order_id)
+            async with bot.pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT delivery_time FROM orders WHERE id=$1", self.order_id)
+            if row is None:
+                return
+            delivery_time = row['delivery_time']
+            try:
+                t = datetime.datetime.strptime(delivery_time, '%H:%M').time()
+            except ValueError:
+                await send_to_criminal_server(self.order_id)
+                return
+
+            safe_start = datetime.time(17, 0)
+            safe_end = datetime.time(18, 0)
+            if safe_start <= t < safe_end:
+                print(f"[INFO] Заказ {self.order_id} - безопасная поставка (время {delivery_time}), уведомление криминалу не отправляется.")
+            else:
+                await send_to_criminal_server(self.order_id)
 
 async def send_to_criminal_server(order_id):
-    """Получает данные заказа и отправляет сообщение на криминальный сервер."""
     async with bot.pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM orders WHERE id=$1", order_id)
         if row is None:
@@ -242,7 +268,6 @@ async def send_to_criminal_server(order_id):
 
     faction = row['faction']
     delivery_time = row['delivery_time']
-    # Формируем упоминания двух ролей
     role_mentions = " ".join(f"<@&{rid}>" for rid in CRIMINAL_ROLE_IDS)
 
     criminal_guild = bot.get_guild(CRIMINAL_GUILD_ID)
@@ -263,7 +288,6 @@ async def send_to_criminal_server(order_id):
     embed.add_field(name="Уведомление", value=role_mentions, inline=False)
     embed.set_footer(text=f"ID заказа: {order_id} | by Ilya Vetrov")
 
-    # Создаём view с кнопкой "Забрать поставку"
     view = CollectView(order_id)
 
     try:
@@ -280,7 +304,7 @@ async def send_to_criminal_server(order_id):
         print(f"[CRIMINAL] Ошибка отправки: {e}")
 
 # ------------------------------------------------------------
-# Кнопка "Забрать поставку" (сервер 2, роли криминалов)
+# Кнопка "Забрать поставку" (сервер 2, криминальные роли)
 # ------------------------------------------------------------
 class CollectView(discord.ui.View):
     def __init__(self, order_id):
@@ -293,7 +317,6 @@ class CollectView(discord.ui.View):
             await interaction.response.send_message("Ошибка.", ephemeral=True)
             return
 
-        # Проверяем, есть ли у пользователя хотя бы одна из разрешённых ролей
         has_role = any(
             interaction.guild.get_role(rid) in interaction.user.roles
             for rid in CRIMINAL_ROLE_IDS
@@ -302,7 +325,6 @@ class CollectView(discord.ui.View):
             await interaction.response.send_message("❌ Только уполномоченные могут забрать поставку.", ephemeral=True)
             return
 
-        # Меняем статус в БД на "collected"
         async with bot.pool.acquire() as conn:
             await conn.execute("UPDATE orders SET status='collected' WHERE id=$1", self.order_id)
 
