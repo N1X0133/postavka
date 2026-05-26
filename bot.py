@@ -8,7 +8,7 @@ from discord.ext import commands
 # ------------------------------------------------------------
 # Константы (идентификаторы твоего сервера, каналов и ролей)
 # ------------------------------------------------------------
-GUILD_ID = 764090907657240586               # ID сервера, на котором работает бот
+GUILD_ID = 764090907657240586               # ID сервера, где работает бот
 ORDER_COMMAND_CHANNEL_ID = 1178807307921002578  # Канал, где можно писать /заказ
 ORDER_APPROVAL_CHANNEL_ID = 767449572015341671  # Канал, куда уходят заявки на одобрение
 ARMY_ROLE_ID = 1508951142292521143          # Роль @Армия
@@ -16,13 +16,13 @@ POLICE_ROLE_ID = 1508951206683213885        # Роль @Полиция (МВД)
 FSB_ROLE_ID = 1508951249444274307           # Роль @ФСБ
 
 # ------------------------------------------------------------
-# Подключение к PostgreSQL (строка вшита напрямую)
+# Подключение к PostgreSQL (SSL отключён, сервер его не требует)
 # ------------------------------------------------------------
 DB_DSN = (
     "postgresql://bothost_db_eb47576e4dad:"
     "VWNyYcmbXI4C7KW-YKqzgvjrwxrMH7RIqWOO3UQEb_4"
     "@node1.pghost.ru:15722/bothost_db_eb47576e4dad"
-    "?sslmode=require"
+    # Без ?sslmode=require, потому что сервер отвергает SSL
 )
 
 async def create_pool():
@@ -63,8 +63,8 @@ class DeliveryBot(commands.Bot):
 # Инициализация
 # ------------------------------------------------------------
 intents = discord.Intents.default()
-intents.message_content = True  # на будущее
-bot = None  # будет создан в main
+intents.message_content = True
+bot = None
 
 # ------------------------------------------------------------
 # Слэш-команда /заказ
@@ -82,7 +82,7 @@ bot = None  # будет создан в main
     app_commands.Choice(name="Полиция", value="Полиция")
 ])
 async def order(interaction: discord.Interaction, фракция: app_commands.Choice[str], время: str):
-    # 1) Проверяем, что команда выполняется в правильном канале
+    # Проверка канала
     if interaction.channel_id != ORDER_COMMAND_CHANNEL_ID:
         await interaction.response.send_message(
             f"❌ Эта команда доступна только в канале <#{ORDER_COMMAND_CHANNEL_ID}>.",
@@ -90,7 +90,7 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
         )
         return
 
-    # 2) Проверяем, что у участника есть нужная роль
+    # Проверка роли
     member = interaction.user
     if not isinstance(member, discord.Member):
         await interaction.response.send_message("Ошибка: не удалось определить участника.", ephemeral=True)
@@ -105,7 +105,7 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
         )
         return
 
-    # 3) Записываем заказ в базу данных
+    # Запись в БД
     async with bot.pool.acquire() as conn:
         order_id = await conn.fetchval(
             "INSERT INTO orders (guild_id, channel_id, author_id, faction, delivery_time) "
@@ -117,7 +117,7 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
             время
         )
 
-    # 4) Создаём Embed для канала одобрения
+    # Embed
     embed = discord.Embed(
         title="🛒 Новый заказ поставки",
         color=discord.Color.blue()
@@ -127,7 +127,6 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
     embed.add_field(name="Заказчик", value=member.mention, inline=True)
     embed.set_footer(text=f"ID заказа: {order_id}")
 
-    # 5) Прикрепляем кнопки
     view = OrderApproveView(order_id)
 
     order_channel = interaction.guild.get_channel(ORDER_APPROVAL_CHANNEL_ID)
@@ -140,7 +139,6 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
 
     message = await order_channel.send(embed=embed, view=view)
 
-    # 6) Сохраняем ID сообщения в БД
     async with bot.pool.acquire() as conn:
         await conn.execute(
             "UPDATE orders SET message_id = $1 WHERE id = $2",
@@ -153,11 +151,11 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
     )
 
 # ------------------------------------------------------------
-# Кнопки «Принять» / «Отклонить» (доступны только Армии)
+# Кнопки «Принять» / «Отклонить»
 # ------------------------------------------------------------
 class OrderApproveView(discord.ui.View):
     def __init__(self, order_id):
-        super().__init__(timeout=None)  # Кнопки не исчезнут по тайм-ауту
+        super().__init__(timeout=None)
         self.order_id = order_id
 
     @discord.ui.button(label="Принять", style=discord.ButtonStyle.green, custom_id="approve_order")
@@ -169,7 +167,6 @@ class OrderApproveView(discord.ui.View):
         await self.process_decision(interaction, "denied", discord.Color.red(), "❌ Отклонено Армией")
 
     async def process_decision(self, interaction: discord.Interaction, new_status: str, color: discord.Color, title: str):
-        # Только Армия может принимать решение
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Ошибка.", ephemeral=True)
             return
@@ -178,14 +175,12 @@ class OrderApproveView(discord.ui.View):
             await interaction.response.send_message("Только Армия может принимать решение.", ephemeral=True)
             return
 
-        # Обновляем статус в БД
         async with bot.pool.acquire() as conn:
             await conn.execute(
                 "UPDATE orders SET status = $1 WHERE id = $2",
                 new_status, self.order_id
             )
 
-        # Редактируем исходное сообщение
         embed = interaction.message.embeds[0]
         embed.title = title
         embed.color = color
