@@ -1,5 +1,4 @@
 import os
-import sys
 import asyncio
 import traceback
 import asyncpg
@@ -8,12 +7,19 @@ from discord import app_commands
 from discord.ext import commands
 
 # ------------------------------------------------------------
-# ID сервера, каналов и ролей
+# ID сервера 1 (гос), каналов и ролей
 # ------------------------------------------------------------
 GUILD_ID = 764090907657240586
 ORDER_CHANNEL_ID = 1178807307921002578
 ORDERER_ROLE_ID = 1178807389420527646
 ARMY_ROLE_ID = 764091598983921674
+
+# ------------------------------------------------------------
+# ID сервера 2 (криминал) и его параметры
+# ------------------------------------------------------------
+CRIMINAL_GUILD_ID = 767449572015341671
+CRIMINAL_CHANNEL_ID = 1476295153525194817
+CRIMINAL_ROLE_ID = 1507772796355219599   # роль, которую упоминаем и которая может забирать
 
 # ------------------------------------------------------------
 # Подключение к PostgreSQL (вшито)
@@ -38,28 +44,32 @@ async def create_pool():
                 author_name TEXT NOT NULL,
                 faction TEXT NOT NULL,
                 delivery_time TEXT NOT NULL,
+                person_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
                 message_id BIGINT,
+                criminal_message_id BIGINT,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
 
-        # Проверяем, есть ли колонка author_name (для совместимости со старыми версиями)
-        column_exists = await conn.fetchval("""
-            SELECT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'orders' AND column_name = 'author_name'
+        # Проверяем и добавляем отсутствующие колонки (для старых таблиц)
+        for col, coltype in [
+            ("person_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("author_name", "TEXT NOT NULL DEFAULT ''"),
+            ("criminal_message_id", "BIGINT")
+        ]:
+            exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name=$1)",
+                col
             )
-        """)
-        if not column_exists:
-            print("[DB] Добавляю отсутствующую колонку author_name...")
-            await conn.execute("ALTER TABLE orders ADD COLUMN author_name TEXT NOT NULL DEFAULT ''")
-            print("[DB] Колонка author_name добавлена.")
+            if not exists:
+                print(f"[DB] Добавляю колонку {col}...")
+                await conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {coltype}")
         print("[DB] Таблица orders готова.")
     return pool
 
 # ------------------------------------------------------------
-# Класс бота с обработчиком ошибок
+# Класс бота
 # ------------------------------------------------------------
 class DeliveryBot(commands.Bot):
     def __init__(self, pool, *args, **kwargs):
@@ -67,7 +77,7 @@ class DeliveryBot(commands.Bot):
         self.pool = pool
 
     async def setup_hook(self):
-        print("[BOT] Синхронизация команд...")
+        print("[BOT] Синхронизация команд на сервере 1...")
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
@@ -81,18 +91,20 @@ class DeliveryBot(commands.Bot):
     ):
         print(f"[ОШИБКА] /{interaction.command.name} от {interaction.user}:")
         traceback.print_exception(type(error), error, error.__traceback__)
-
-        if interaction.response.is_done():
-            await interaction.followup.send(f"❌ Внутренняя ошибка: {error}", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"❌ Внутренняя ошибка: {error}", ephemeral=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Внутренняя ошибка: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Внутренняя ошибка: {error}", ephemeral=True)
+        except Exception:
+            pass
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = None
 
 # ------------------------------------------------------------
-# Слэш-команда /заказ
+# Слэш-команда /заказ (сервер 1)
 # ------------------------------------------------------------
 @discord.app_commands.command(
     name="заказ",
@@ -100,24 +112,28 @@ bot = None
 )
 @app_commands.describe(
     фракция="Выберите фракцию",
-    время="Время поставки (например, 15:00)"
+    время="Время поставки (например, 15:00)",
+    количество="Кол-во человек от вашей фракции"
 )
 @app_commands.choices(фракция=[
     app_commands.Choice(name="ФСБ", value="ФСБ"),
     app_commands.Choice(name="Полиция", value="Полиция")
 ])
-async def order(interaction: discord.Interaction, фракция: app_commands.Choice[str], время: str):
-    print(f"[CMD] /заказ вызван {interaction.user} в канале {interaction.channel_id}")
+async def order(
+    interaction: discord.Interaction,
+    фракция: app_commands.Choice[str],
+    время: str,
+    количество: int
+):
+    print(f"[CMD] /заказ вызван {interaction.user} (канал {interaction.channel_id})")
     await interaction.response.defer(ephemeral=True)
 
-    # Проверка канала
     if interaction.channel_id != ORDER_CHANNEL_ID:
         channel = interaction.guild.get_channel(ORDER_CHANNEL_ID)
         mention = channel.mention if channel else "указанный канал"
         await interaction.followup.send(f"❌ Эта команда доступна только в канале {mention}.", ephemeral=True)
         return
 
-    # Проверка роли заказчика
     member = interaction.user
     if not isinstance(member, discord.Member):
         await interaction.followup.send("Ошибка: не удалось определить участника.", ephemeral=True)
@@ -128,28 +144,33 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
         await interaction.followup.send("❌ У вас нет роли заказчика.", ephemeral=True)
         return
 
+    if количество <= 0:
+        await interaction.followup.send("❌ Количество человек должно быть больше нуля.", ephemeral=True)
+        return
+
     # Запись в БД
     async with bot.pool.acquire() as conn:
         order_id = await conn.fetchval(
-            "INSERT INTO orders (guild_id, channel_id, author_id, author_name, faction, delivery_time) "
-            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            "INSERT INTO orders (guild_id, channel_id, author_id, author_name, faction, delivery_time, person_count) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
             interaction.guild_id,
             interaction.channel_id,
             member.id,
             str(member),
             фракция.value,
-            время
+            время,
+            количество
         )
 
-    # Embed и кнопки
     embed = discord.Embed(
         title="🛒 Новый заказ поставки",
         color=discord.Color.blue()
     )
     embed.add_field(name="Фракция", value=фракция.value, inline=True)
     embed.add_field(name="Время поставки", value=время, inline=True)
-    embed.add_field(name="Заказчик", value=member.mention, inline=True)
-    embed.set_footer(text=f"ID заказа: {order_id}")
+    embed.add_field(name="Кол-во человек", value=str(количество), inline=True)
+    embed.add_field(name="Заказчик", value=member.mention, inline=False)
+    embed.set_footer(text=f"ID заказа: {order_id} | by Ilya Vetrov")
 
     view = OrderApproveView(order_id)
 
@@ -164,17 +185,13 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
         await interaction.followup.send("❌ У бота нет прав отправлять сообщения.", ephemeral=True)
         return
 
-    # Сохраняем message_id
     async with bot.pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE orders SET message_id = $1 WHERE id = $2",
-            message.id, order_id
-        )
+        await conn.execute("UPDATE orders SET message_id=$1 WHERE id=$2", message.id, order_id)
 
     await interaction.followup.send(f"✅ Заказ №{order_id} создан и отправлен на одобрение.", ephemeral=True)
 
 # ------------------------------------------------------------
-# Кнопки (только Армия)
+# Кнопки «Принять» / «Отклонить» (сервер 1, роль Армия)
 # ------------------------------------------------------------
 class OrderApproveView(discord.ui.View):
     def __init__(self, order_id):
@@ -198,11 +215,9 @@ class OrderApproveView(discord.ui.View):
             await interaction.response.send_message("Только Армия может принимать решение.", ephemeral=True)
             return
 
+        # Обновляем статус в БД
         async with bot.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE orders SET status = $1 WHERE id = $2",
-                new_status, self.order_id
-            )
+            await conn.execute("UPDATE orders SET status=$1 WHERE id=$2", new_status, self.order_id)
 
         embed = interaction.message.embeds[0]
         embed.title = title
@@ -211,6 +226,95 @@ class OrderApproveView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(embed=embed, view=self)
+
+        # Если одобрено – отправляем уведомление на сервер 2
+        if new_status == "approved":
+            await send_to_criminal_server(self.order_id)
+
+async def send_to_criminal_server(order_id):
+    """Получает данные заказа и отправляет сообщение на криминальный сервер."""
+    async with bot.pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM orders WHERE id=$1", order_id)
+        if row is None:
+            print(f"[CRIMINAL] Заказ {order_id} не найден в БД")
+            return
+
+    faction = row['faction']
+    delivery_time = row['delivery_time']
+    # Роль криминалов (упоминаем дважды, как просили)
+    role_mention = f"<@&{CRIMINAL_ROLE_ID}>"
+
+    # Получаем сервер и канал
+    criminal_guild = bot.get_guild(CRIMINAL_GUILD_ID)
+    if criminal_guild is None:
+        print(f"[CRIMINAL] Сервер {CRIMINAL_GUILD_ID} не найден. Бот приглашён?")
+        return
+    channel = criminal_guild.get_channel(CRIMINAL_CHANNEL_ID)
+    if channel is None:
+        print(f"[CRIMINAL] Канал {CRIMINAL_CHANNEL_ID} не найден на сервере {CRIMINAL_GUILD_ID}.")
+        return
+
+    # Формируем embed
+    embed = discord.Embed(
+        title="📦 Поставка для криминальных структур",
+        color=discord.Color.orange()
+    )
+    embed.add_field(name="Фракция", value=faction, inline=True)
+    embed.add_field(name="Время поставки", value=delivery_time, inline=True)
+    embed.add_field(name="Уведомление", value=f"{role_mention} {role_mention}", inline=False)
+    embed.set_footer(text=f"ID заказа: {order_id} | by Ilya Vetrov")
+
+    # Создаём view с кнопкой "Забрать поставку"
+    view = CollectView(order_id)
+
+    try:
+        msg = await channel.send(content=role_mention, embed=embed, view=view)
+        # Сохраняем ID этого сообщения в БД
+        async with bot.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE orders SET criminal_message_id=$1 WHERE id=$2",
+                msg.id, order_id
+            )
+        print(f"[CRIMINAL] Сообщение о поставке {order_id} отправлено в {channel.id}")
+    except discord.Forbidden:
+        print("[CRIMINAL] Нет прав на отправку сообщения.")
+    except Exception as e:
+        print(f"[CRIMINAL] Ошибка отправки: {e}")
+
+# ------------------------------------------------------------
+# Кнопка "Забрать поставку" (сервер 2, роль криминалов)
+# ------------------------------------------------------------
+class CollectView(discord.ui.View):
+    def __init__(self, order_id):
+        super().__init__(timeout=None)
+        self.order_id = order_id
+
+    @discord.ui.button(label="Забрать поставку", style=discord.ButtonStyle.primary, custom_id="collect_delivery")
+    async def collect(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Проверяем роль
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Ошибка.", ephemeral=True)
+            return
+        role = interaction.guild.get_role(CRIMINAL_ROLE_ID)
+        if role is None or role not in interaction.user.roles:
+            await interaction.response.send_message("❌ Только уполномоченные могут забрать поставку.", ephemeral=True)
+            return
+
+        # Меняем статус в БД на "collected"
+        async with bot.pool.acquire() as conn:
+            await conn.execute("UPDATE orders SET status='collected' WHERE id=$1", self.order_id)
+
+        # Обновляем сообщение: меняем embed, отключаем кнопку
+        embed = interaction.message.embeds[0]
+        embed.title = "✅ Поставка забрана"
+        embed.color = discord.Color.green()
+        embed.set_footer(text=embed.footer.text + " | Статус: забрана")
+        # Убираем кнопку
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+
+        # Опционально: уведомим заказчика в ЛС? Пока не делаем.
 
 # ------------------------------------------------------------
 # Запуск
