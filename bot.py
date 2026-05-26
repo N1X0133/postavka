@@ -6,27 +6,24 @@ from discord import app_commands
 from discord.ext import commands
 
 # ------------------------------------------------------------
-# Константы (идентификаторы твоего сервера, каналов и ролей)
+# ID сервера, каналов и ролей
 # ------------------------------------------------------------
-GUILD_ID = 764090907657240586               # ID сервера, где работает бот
-ORDER_COMMAND_CHANNEL_ID = 1178807307921002578  # Канал, где можно писать /заказ
-ORDER_APPROVAL_CHANNEL_ID = 767449572015341671  # Канал, куда уходят заявки на одобрение
-ARMY_ROLE_ID = 1508951142292521143          # Роль @Армия
-POLICE_ROLE_ID = 1508951206683213885        # Роль @Полиция (МВД)
-FSB_ROLE_ID = 1508951249444274307           # Роль @ФСБ
+GUILD_ID = 764090907657240586
+ORDER_COMMAND_CHANNEL_ID = 1178807307921002578   # Канал для /заказ
+ORDER_APPROVAL_CHANNEL_ID = 767449572015341671   # Канал одобрения
+ORDERER_ROLE_ID = 1178807389420527646            # Роль заказчика
+ARMY_ROLE_ID = 764091598983921674                # Роль Армии (одобрение)
 
 # ------------------------------------------------------------
-# Подключение к PostgreSQL (SSL отключён, сервер его не требует)
+# Подключение к PostgreSQL (вшито)
 # ------------------------------------------------------------
 DB_DSN = (
     "postgresql://bothost_db_eb47576e4dad:"
     "VWNyYcmbXI4C7KW-YKqzgvjrwxrMH7RIqWOO3UQEb_4"
     "@node1.pghost.ru:15722/bothost_db_eb47576e4dad"
-    # Без ?sslmode=require, потому что сервер отвергает SSL
 )
 
 async def create_pool():
-    """Создаёт пул соединений и инициализирует таблицу заказов."""
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -35,6 +32,7 @@ async def create_pool():
                 guild_id BIGINT NOT NULL,
                 channel_id BIGINT NOT NULL,
                 author_id BIGINT NOT NULL,
+                author_name TEXT NOT NULL,
                 faction TEXT NOT NULL,
                 delivery_time TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -53,15 +51,11 @@ class DeliveryBot(commands.Bot):
         self.pool = pool
 
     async def setup_hook(self):
-        """Синхронизация слэш-команд с сервером."""
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         print(f"Слэш-команды синхронизированы с сервером {GUILD_ID}")
 
-# ------------------------------------------------------------
-# Инициализация
-# ------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = None
@@ -74,7 +68,7 @@ bot = None
     description="Заказать поставку для своей фракции"
 )
 @app_commands.describe(
-    фракция="Выберите вашу фракцию",
+    фракция="Выберите фракцию",
     время="Время поставки (например, 15:00)"
 )
 @app_commands.choices(фракция=[
@@ -82,7 +76,7 @@ bot = None
     app_commands.Choice(name="Полиция", value="Полиция")
 ])
 async def order(interaction: discord.Interaction, фракция: app_commands.Choice[str], время: str):
-    # Проверка канала
+    # 1) Проверка канала
     if interaction.channel_id != ORDER_COMMAND_CHANNEL_ID:
         await interaction.response.send_message(
             f"❌ Эта команда доступна только в канале <#{ORDER_COMMAND_CHANNEL_ID}>.",
@@ -90,34 +84,34 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
         )
         return
 
-    # Проверка роли
+    # 2) Проверка роли заказчика
     member = interaction.user
     if not isinstance(member, discord.Member):
         await interaction.response.send_message("Ошибка: не удалось определить участника.", ephemeral=True)
         return
 
-    required_role_id = FSB_ROLE_ID if фракция.value == "ФСБ" else POLICE_ROLE_ID
-    required_role = interaction.guild.get_role(required_role_id)
-    if required_role is None or required_role not in member.roles:
+    orderer_role = interaction.guild.get_role(ORDERER_ROLE_ID)
+    if orderer_role is None or orderer_role not in member.roles:
         await interaction.response.send_message(
-            f"❌ У вас нет роли {required_role.name if required_role else 'необходимой фракции'}.",
+            "❌ У вас нет роли заказчика. Обратитесь к командованию.",
             ephemeral=True
         )
         return
 
-    # Запись в БД
+    # 3) Запись в БД
     async with bot.pool.acquire() as conn:
         order_id = await conn.fetchval(
-            "INSERT INTO orders (guild_id, channel_id, author_id, faction, delivery_time) "
-            "VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            "INSERT INTO orders (guild_id, channel_id, author_id, author_name, faction, delivery_time) "
+            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
             interaction.guild_id,
             interaction.channel_id,
             member.id,
+            str(member),
             фракция.value,
             время
         )
 
-    # Embed
+    # 4) Embed с фракцией
     embed = discord.Embed(
         title="🛒 Новый заказ поставки",
         color=discord.Color.blue()
@@ -151,7 +145,7 @@ async def order(interaction: discord.Interaction, фракция: app_commands.C
     )
 
 # ------------------------------------------------------------
-# Кнопки «Принять» / «Отклонить»
+# Кнопки «Принять» / «Отклонить» (только Армия)
 # ------------------------------------------------------------
 class OrderApproveView(discord.ui.View):
     def __init__(self, order_id):
@@ -170,6 +164,7 @@ class OrderApproveView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Ошибка.", ephemeral=True)
             return
+
         army_role = interaction.guild.get_role(ARMY_ROLE_ID)
         if army_role is None or army_role not in interaction.user.roles:
             await interaction.response.send_message("Только Армия может принимать решение.", ephemeral=True)
