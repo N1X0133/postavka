@@ -147,14 +147,12 @@ async def order(
         await interaction.followup.send("❌ Количество человек должно быть больше нуля.", ephemeral=True)
         return
 
-    # Валидация формата времени
     try:
         parsed_time = datetime.datetime.strptime(время, '%H:%M')
     except ValueError:
         await interaction.followup.send("❌ Неверный формат времени. Используйте ЧЧ:ММ (например, 15:00).", ephemeral=True)
         return
 
-    # Запись в БД
     async with bot.pool.acquire() as conn:
         order_id = await conn.fetchval(
             "INSERT INTO orders (guild_id, channel_id, author_id, author_name, faction, delivery_time, person_count) "
@@ -168,7 +166,6 @@ async def order(
             количество
         )
 
-    # Создаём Embed с видимым упоминанием роли Армии
     army_mention = f"<@&{ARMY_ROLE_ID}>"
     embed = discord.Embed(
         title="🛒 Новый заказ поставки",
@@ -189,12 +186,7 @@ async def order(
         return
 
     try:
-        # Пинг роли (контент) + embed с упоминанием
-        message = await order_channel.send(
-            content=army_mention,
-            embed=embed,
-            view=view
-        )
+        message = await order_channel.send(content=army_mention, embed=embed, view=view)
     except discord.Forbidden:
         await interaction.followup.send("❌ У бота нет прав отправлять сообщения.", ephemeral=True)
         return
@@ -205,7 +197,7 @@ async def order(
     await interaction.followup.send(f"✅ Заказ №{order_id} создан и отправлен на одобрение.", ephemeral=True)
 
 # ------------------------------------------------------------
-# Кнопки «Принять» / «Отклонить» (сервер 1, роль Армия)
+# Кнопки «Принять» / «Отклонить» (сервер 1) + отображение кто нажал
 # ------------------------------------------------------------
 class OrderApproveView(discord.ui.View):
     def __init__(self, order_id):
@@ -235,6 +227,12 @@ class OrderApproveView(discord.ui.View):
         embed = interaction.message.embeds[0]
         embed.title = title
         embed.color = color
+        # Добавляем информацию о том, кто нажал кнопку
+        embed.add_field(
+            name="Решение",
+            value=f"{interaction.user.mention} ({new_status})",
+            inline=False
+        )
         embed.set_footer(text=embed.footer.text + f" | Статус: {new_status}")
         for child in self.children:
             child.disabled = True
@@ -304,7 +302,7 @@ async def send_to_criminal_server(order_id):
         print(f"[CRIMINAL] Ошибка отправки: {e}")
 
 # ------------------------------------------------------------
-# Кнопка "Забрать поставку" (сервер 2, криминальные роли)
+# Кнопка "Забрать поставку" (сервер 2) + отображение кто забрал
 # ------------------------------------------------------------
 class CollectView(discord.ui.View):
     def __init__(self, order_id):
@@ -331,6 +329,11 @@ class CollectView(discord.ui.View):
         embed = interaction.message.embeds[0]
         embed.title = "✅ Поставка забрана"
         embed.color = discord.Color.green()
+        embed.add_field(
+            name="Забрал",
+            value=interaction.user.mention,
+            inline=False
+        )
         embed.set_footer(text=embed.footer.text + " | Статус: забрана")
         for child in self.children:
             child.disabled = True
