@@ -16,7 +16,7 @@ ORDERER_ROLE_ID = 1178807389420527646
 ARMY_ROLE_ID = 764091598983921674
 
 # ------------------------------------------------------------
-# DB (НЕ ТРОГАТЬ)
+# DATABASE (НЕ ТРОГАТЬ)
 # ------------------------------------------------------------
 DB_DSN = (
     "postgresql://bothost_db_eb47576e4dad:"
@@ -91,7 +91,11 @@ async def order(interaction: discord.Interaction,
     await interaction.response.defer(ephemeral=True)
 
     if interaction.channel_id != ORDER_CHANNEL_ID:
-        return await interaction.followup.send("❌ Неверный канал", ephemeral=True)
+        ch = interaction.guild.get_channel(ORDER_CHANNEL_ID)
+        return await interaction.followup.send(
+            f"❌ Используйте канал {ch.mention if ch else 'назначенный'}",
+            ephemeral=True
+        )
 
     member = interaction.user
 
@@ -119,7 +123,7 @@ async def order(interaction: discord.Interaction,
              member.id, str(member), фракция.value, время, количество)
 
     # ------------------------------------------------------------
-    # EMBED (ИСПРАВЛЕН СТАТУС)
+    # EMBED
     # ------------------------------------------------------------
     orderer_role = interaction.guild.get_role(ORDERER_ROLE_ID)
     army_role = interaction.guild.get_role(ARMY_ROLE_ID)
@@ -132,7 +136,7 @@ async def order(interaction: discord.Interaction,
 
     embed.add_field(name="🏷️ Фракция", value=f"```{фракция.value}```", inline=True)
     embed.add_field(name="⏰ Время", value=f"```{время}```", inline=True)
-    embed.add_field(name="👥 Кол-во", value=f"```{количество}```", inline=True)
+    embed.add_field(name="👥 Количество", value=f"```{количество}```", inline=True)
 
     embed.add_field(name="👤 Заказчик", value=member.mention, inline=False)
 
@@ -148,8 +152,7 @@ async def order(interaction: discord.Interaction,
         inline=True
     )
 
-    # 🔥 ВАЖНО: статус отдельным field
-    status_field_index = len(embed.fields)
+    # статус (фиксированный индекс)
     embed.add_field(
         name="📌 Статус",
         value="🟡 Ожидает обработки",
@@ -158,11 +161,13 @@ async def order(interaction: discord.Interaction,
 
     embed.set_footer(text=f"Order #{order_id}")
 
-    view = OrderApproveView(order_id, status_field_index)
+    view = OrderApproveView(order_id)
 
     channel = interaction.guild.get_channel(ORDER_CHANNEL_ID)
+
+    # 🪖 ПИНГ АРМИИ
     msg = await channel.send(
-        content=army_role.mention if army_role else None,  # 🪖 ПИНГ АРМИИ
+        content=army_role.mention if army_role else None,
         embed=embed,
         view=view
     )
@@ -177,23 +182,22 @@ async def order(interaction: discord.Interaction,
 
 
 # ------------------------------------------------------------
-# BUTTONS (ИСПРАВЛЕН СТАТУС)
+# BUTTONS
 # ------------------------------------------------------------
 class OrderApproveView(discord.ui.View):
-    def __init__(self, order_id, status_index):
+    def __init__(self, order_id):
         super().__init__(timeout=None)
         self.order_id = order_id
-        self.status_index = status_index
 
     @discord.ui.button(label="Принять", style=discord.ButtonStyle.green)
     async def approve(self, interaction, button):
-        await self.update(interaction, "approved", "🟢 Принято")
+        await self._handle(interaction, "approved", "Принято")
 
     @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.red)
     async def deny(self, interaction, button):
-        await self.update(interaction, "denied", "🔴 Отклонено")
+        await self._handle(interaction, "denied", "Отклонено")
 
-    async def update(self, interaction, status, title):
+    async def _handle(self, interaction, status, title):
         role = interaction.guild.get_role(ARMY_ROLE_ID)
 
         if role not in interaction.user.roles:
@@ -207,11 +211,18 @@ class OrderApproveView(discord.ui.View):
 
         embed = interaction.message.embeds[0]
 
-        # 🔥 ОБНОВЛЕНИЕ СТАТУСА (ПРАВИЛЬНО)
+        # обновляем статус (7-й field)
         embed.set_field_at(
-            self.status_index,
+            6,
             name="📌 Статус",
-            value=("🟢 Принято" if status == "approved" else "🔴 Отклонено"),
+            value="🟢 Принято" if status == "approved" else "🔴 Отклонено",
+            inline=False
+        )
+
+        # 👤 кто обработал
+        embed.add_field(
+            name="👮 Обработал",
+            value=interaction.user.mention,
             inline=False
         )
 
