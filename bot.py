@@ -24,6 +24,7 @@ DB_DSN = (
     "@node1.pghost.ru:15722/bothost_db_eb47576e4dad"
 )
 
+
 async def create_pool():
     print("[DB] Connecting...")
 
@@ -51,7 +52,7 @@ async def create_pool():
 
 
 # ------------------------------------------------------------
-# BOT CLASS
+# BOT
 # ------------------------------------------------------------
 class DeliveryBot(commands.Bot):
     def __init__(self, pool):
@@ -72,7 +73,7 @@ class DeliveryBot(commands.Bot):
     async def on_application_command_error(self, interaction, error):
         traceback.print_exception(type(error), error, error.__traceback__)
         try:
-            msg = f"❌ Error: {error}"
+            msg = f"❌ Ошибка: {error}"
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
             else:
@@ -85,13 +86,13 @@ bot = None
 
 
 # ------------------------------------------------------------
-# /заказ COMMAND
+# /заказ
 # ------------------------------------------------------------
-@app_commands.command(name="заказ", description="Создать заказ")
+@app_commands.command(name="заказ", description="Создать заказ поставки")
 @app_commands.describe(
     фракция="Фракция",
-    время="Время (ЧЧ:ММ)",
-    количество="Количество"
+    время="ЧЧ:ММ",
+    количество="Количество людей"
 )
 @app_commands.choices(фракция=[
     app_commands.Choice(name="ФСБ", value="ФСБ"),
@@ -104,6 +105,7 @@ async def order(interaction: discord.Interaction,
 
     await interaction.response.defer(ephemeral=True)
 
+    # проверка канала
     if interaction.channel_id != ORDER_CHANNEL_ID:
         ch = interaction.guild.get_channel(ORDER_CHANNEL_ID)
         await interaction.followup.send(
@@ -116,11 +118,13 @@ async def order(interaction: discord.Interaction,
     if not isinstance(member, discord.Member):
         return
 
+    # проверка роли заказчика
     role = interaction.guild.get_role(ORDERER_ROLE_ID)
     if role not in member.roles:
         await interaction.followup.send("❌ Нет доступа", ephemeral=True)
         return
 
+    # проверка данных
     if количество <= 0:
         await interaction.followup.send("❌ Некорректное количество", ephemeral=True)
         return
@@ -128,9 +132,10 @@ async def order(interaction: discord.Interaction,
     try:
         datetime.datetime.strptime(время, "%H:%M")
     except ValueError:
-        await interaction.followup.send("❌ Время должно быть ЧЧ:ММ", ephemeral=True)
+        await interaction.followup.send("❌ Формат времени ЧЧ:ММ", ephemeral=True)
         return
 
+    # запись в БД
     async with bot.pool.acquire() as conn:
         order_id = await conn.fetchval("""
             INSERT INTO orders (
@@ -143,54 +148,61 @@ async def order(interaction: discord.Interaction,
              member.id, str(member), фракция.value, время, количество)
 
     # ------------------------------------------------------------
-    # TERMINAL STYLE EMBED + ROLES
+    # EMBED (классический + роли)
     # ------------------------------------------------------------
+    orderer_role = interaction.guild.get_role(ORDERER_ROLE_ID)
+    army_role = interaction.guild.get_role(ARMY_ROLE_ID)
+
     embed = discord.Embed(
-        title="> SYSTEM :: NEW ORDER RECEIVED",
-        color=discord.Color.dark_grey(),
+        title="📦 Новый заказ поставки",
+        color=discord.Color.from_rgb(52, 152, 219),
         timestamp=datetime.datetime.utcnow()
     )
 
-    embed.description = (
-        "```"
-        f"[INIT] ORDER_ID      :: #{order_id}\n"
-        f"[INIT] FACTION       :: {фракция.value}\n"
-        f"[INIT] DELIVERY     :: {время}\n"
-        f"[INIT] PERSON_COUNT  :: {количество}\n"
-        f"[INIT] USER         :: {member.name} ({member.id})\n"
-        "```\n"
-        "```diff\n"
-        "- STATUS: PENDING APPROVAL\n"
-        "+ ROUTING: DISPATCH QUEUE ACTIVE\n"
-        "```"
-    )
-
     embed.add_field(
-        name="👮 ORDERER ROLE",
-        value=f"```{interaction.guild.get_role(ORDERER_ROLE_ID).name}```",
-        inline=True
-    )
-
-    embed.add_field(
-        name="🪖 ARMY ROLE",
-        value=f"```{interaction.guild.get_role(ARMY_ROLE_ID).name}```",
-        inline=True
-    )
-
-    embed.add_field(
-        name="📌 FACTION",
+        name="🏷️ Фракция",
         value=f"```{фракция.value}```",
         inline=True
     )
 
     embed.add_field(
-        name="👤 DISCORD ROLES",
-        value=", ".join([r.name for r in member.roles if r != interaction.guild.default_role]),
+        name="⏰ Время доставки",
+        value=f"```{время}```",
+        inline=True
+    )
+
+    embed.add_field(
+        name="👥 Количество",
+        value=f"```{количество}```",
+        inline=True
+    )
+
+    embed.add_field(
+        name="👤 Заказчик",
+        value=member.mention,
+        inline=False
+    )
+
+    embed.add_field(
+        name="👮 Роль заказчика",
+        value=orderer_role.mention if orderer_role else "N/A",
+        inline=True
+    )
+
+    embed.add_field(
+        name="🪖 Роль Армия (контроль)",
+        value=army_role.mention if army_role else "N/A",
+        inline=True
+    )
+
+    embed.add_field(
+        name="📌 Статус",
+        value="🟡 Ожидает обработки",
         inline=False
     )
 
     embed.set_footer(
-        text="secure-node://dispatch-system • verified session",
+        text=f"Order ID: #{order_id}",
         icon_url=interaction.guild.icon.url if interaction.guild.icon else None
     )
 
@@ -209,7 +221,7 @@ async def order(interaction: discord.Interaction,
 
 
 # ------------------------------------------------------------
-# BUTTONS
+# КНОПКИ
 # ------------------------------------------------------------
 class OrderApproveView(discord.ui.View):
     def __init__(self, order_id):
@@ -218,14 +230,15 @@ class OrderApproveView(discord.ui.View):
 
     @discord.ui.button(label="Принять", style=discord.ButtonStyle.green)
     async def approve(self, interaction, button):
-        await self._handle(interaction, "approved", "APPROVED")
+        await self._handle(interaction, "approved", "Принято")
 
     @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.red)
     async def deny(self, interaction, button):
-        await self._handle(interaction, "denied", "REJECTED")
+        await self._handle(interaction, "denied", "Отклонено")
 
     async def _handle(self, interaction, status, title):
         role = interaction.guild.get_role(ARMY_ROLE_ID)
+
         if role not in interaction.user.roles:
             await interaction.response.send_message("❌ Нет доступа", ephemeral=True)
             return
@@ -237,8 +250,12 @@ class OrderApproveView(discord.ui.View):
             )
 
         embed = interaction.message.embeds[0]
-        embed.title = f"> SYSTEM :: ORDER {title}"
-        embed.color = discord.Color.green() if status == "approved" else discord.Color.red()
+        embed.title = f"📦 Заказ: {title}"
+
+        embed.color = (
+            discord.Color.green() if status == "approved"
+            else discord.Color.red()
+        )
 
         for c in self.children:
             c.disabled = True
@@ -258,7 +275,7 @@ async def main():
 
     token = os.getenv("DISCORD_TOKEN")
     if not token:
-        raise ValueError("DISCORD_TOKEN not set")
+        raise ValueError("DISCORD_TOKEN не задан")
 
     await bot.start(token)
 
