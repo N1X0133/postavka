@@ -16,7 +16,7 @@ ORDERER_ROLE_ID = 1178807389420527646
 ARMY_ROLE_ID = 764091598983921674
 
 # ------------------------------------------------------------
-# DATABASE (НЕ ТРОГАТЬ)
+# DB (НЕ ТРОГАТЬ)
 # ------------------------------------------------------------
 DB_DSN = (
     "postgresql://bothost_db_eb47576e4dad:"
@@ -26,8 +26,6 @@ DB_DSN = (
 
 
 async def create_pool():
-    print("[DB] Connecting...")
-
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
 
     async with pool.acquire() as conn:
@@ -47,7 +45,6 @@ async def create_pool():
         )
         """)
 
-    print("[DB] Ready")
     return pool
 
 
@@ -65,21 +62,9 @@ class DeliveryBot(commands.Bot):
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
-        print("[BOT] Slash commands synced")
 
     async def on_ready(self):
         print(f"[BOT] Logged in as {self.user}")
-
-    async def on_application_command_error(self, interaction, error):
-        traceback.print_exception(type(error), error, error.__traceback__)
-        try:
-            msg = f"❌ Ошибка: {error}"
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
-        except:
-            pass
 
 
 bot = None
@@ -92,7 +77,7 @@ bot = None
 @app_commands.describe(
     фракция="Фракция",
     время="ЧЧ:ММ",
-    количество="Количество людей"
+    количество="Количество"
 )
 @app_commands.choices(фракция=[
     app_commands.Choice(name="ФСБ", value="ФСБ"),
@@ -105,37 +90,23 @@ async def order(interaction: discord.Interaction,
 
     await interaction.response.defer(ephemeral=True)
 
-    # проверка канала
     if interaction.channel_id != ORDER_CHANNEL_ID:
-        ch = interaction.guild.get_channel(ORDER_CHANNEL_ID)
-        await interaction.followup.send(
-            f"❌ Используйте канал {ch.mention if ch else 'назначенный'}",
-            ephemeral=True
-        )
-        return
+        return await interaction.followup.send("❌ Неверный канал", ephemeral=True)
 
     member = interaction.user
-    if not isinstance(member, discord.Member):
-        return
 
-    # проверка роли заказчика
     role = interaction.guild.get_role(ORDERER_ROLE_ID)
     if role not in member.roles:
-        await interaction.followup.send("❌ Нет доступа", ephemeral=True)
-        return
+        return await interaction.followup.send("❌ Нет доступа", ephemeral=True)
 
-    # проверка данных
     if количество <= 0:
-        await interaction.followup.send("❌ Некорректное количество", ephemeral=True)
-        return
+        return await interaction.followup.send("❌ Количество неверное", ephemeral=True)
 
     try:
         datetime.datetime.strptime(время, "%H:%M")
     except ValueError:
-        await interaction.followup.send("❌ Формат времени ЧЧ:ММ", ephemeral=True)
-        return
+        return await interaction.followup.send("❌ Время ЧЧ:ММ", ephemeral=True)
 
-    # запись в БД
     async with bot.pool.acquire() as conn:
         order_id = await conn.fetchval("""
             INSERT INTO orders (
@@ -148,7 +119,7 @@ async def order(interaction: discord.Interaction,
              member.id, str(member), фракция.value, время, количество)
 
     # ------------------------------------------------------------
-    # EMBED (классический + роли)
+    # EMBED (ИСПРАВЛЕН СТАТУС)
     # ------------------------------------------------------------
     orderer_role = interaction.guild.get_role(ORDERER_ROLE_ID)
     army_role = interaction.guild.get_role(ARMY_ROLE_ID)
@@ -159,29 +130,11 @@ async def order(interaction: discord.Interaction,
         timestamp=datetime.datetime.utcnow()
     )
 
-    embed.add_field(
-        name="🏷️ Фракция",
-        value=f"```{фракция.value}```",
-        inline=True
-    )
+    embed.add_field(name="🏷️ Фракция", value=f"```{фракция.value}```", inline=True)
+    embed.add_field(name="⏰ Время", value=f"```{время}```", inline=True)
+    embed.add_field(name="👥 Кол-во", value=f"```{количество}```", inline=True)
 
-    embed.add_field(
-        name="⏰ Время доставки",
-        value=f"```{время}```",
-        inline=True
-    )
-
-    embed.add_field(
-        name="👥 Количество",
-        value=f"```{количество}```",
-        inline=True
-    )
-
-    embed.add_field(
-        name="👤 Заказчик",
-        value=member.mention,
-        inline=False
-    )
+    embed.add_field(name="👤 Заказчик", value=member.mention, inline=False)
 
     embed.add_field(
         name="👮 Роль заказчика",
@@ -190,26 +143,29 @@ async def order(interaction: discord.Interaction,
     )
 
     embed.add_field(
-        name="🪖 Роль Армия (контроль)",
+        name="🪖 Армия (контроль)",
         value=army_role.mention if army_role else "N/A",
         inline=True
     )
 
+    # 🔥 ВАЖНО: статус отдельным field
+    status_field_index = len(embed.fields)
     embed.add_field(
         name="📌 Статус",
         value="🟡 Ожидает обработки",
         inline=False
     )
 
-    embed.set_footer(
-        text=f"Order ID: #{order_id}",
-        icon_url=interaction.guild.icon.url if interaction.guild.icon else None
-    )
+    embed.set_footer(text=f"Order #{order_id}")
 
-    view = OrderApproveView(order_id)
+    view = OrderApproveView(order_id, status_field_index)
 
     channel = interaction.guild.get_channel(ORDER_CHANNEL_ID)
-    msg = await channel.send(embed=embed, view=view)
+    msg = await channel.send(
+        content=army_role.mention if army_role else None,  # 🪖 ПИНГ АРМИИ
+        embed=embed,
+        view=view
+    )
 
     async with bot.pool.acquire() as conn:
         await conn.execute(
@@ -221,27 +177,27 @@ async def order(interaction: discord.Interaction,
 
 
 # ------------------------------------------------------------
-# КНОПКИ
+# BUTTONS (ИСПРАВЛЕН СТАТУС)
 # ------------------------------------------------------------
 class OrderApproveView(discord.ui.View):
-    def __init__(self, order_id):
+    def __init__(self, order_id, status_index):
         super().__init__(timeout=None)
         self.order_id = order_id
+        self.status_index = status_index
 
     @discord.ui.button(label="Принять", style=discord.ButtonStyle.green)
     async def approve(self, interaction, button):
-        await self._handle(interaction, "approved", "Принято")
+        await self.update(interaction, "approved", "🟢 Принято")
 
     @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.red)
     async def deny(self, interaction, button):
-        await self._handle(interaction, "denied", "Отклонено")
+        await self.update(interaction, "denied", "🔴 Отклонено")
 
-    async def _handle(self, interaction, status, title):
+    async def update(self, interaction, status, title):
         role = interaction.guild.get_role(ARMY_ROLE_ID)
 
         if role not in interaction.user.roles:
-            await interaction.response.send_message("❌ Нет доступа", ephemeral=True)
-            return
+            return await interaction.response.send_message("❌ Нет доступа", ephemeral=True)
 
         async with bot.pool.acquire() as conn:
             await conn.execute(
@@ -250,12 +206,16 @@ class OrderApproveView(discord.ui.View):
             )
 
         embed = interaction.message.embeds[0]
-        embed.title = f"📦 Заказ: {title}"
 
-        embed.color = (
-            discord.Color.green() if status == "approved"
-            else discord.Color.red()
+        # 🔥 ОБНОВЛЕНИЕ СТАТУСА (ПРАВИЛЬНО)
+        embed.set_field_at(
+            self.status_index,
+            name="📌 Статус",
+            value=("🟢 Принято" if status == "approved" else "🔴 Отклонено"),
+            inline=False
         )
+
+        embed.title = f"📦 Заказ #{self.order_id} — {title}"
 
         for c in self.children:
             c.disabled = True
@@ -274,9 +234,6 @@ async def main():
     bot.tree.add_command(order)
 
     token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        raise ValueError("DISCORD_TOKEN не задан")
-
     await bot.start(token)
 
 
